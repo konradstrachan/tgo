@@ -30,15 +30,22 @@ ALLOWED_USER_IDS = [
     int(uid.strip()) for uid in os.environ.get("ALLOWED_USER_IDS", "").split(",") if uid.strip()
 ]
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")  # default model name
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")  # preferred model name
 OLLAMA_TIMEOUT_SECS = int(os.environ.get("OLLAMA_TIMEOUT_SECS", "300"))  # per request timeout
 STREAM_EDIT_THROTTLE_SECS = float(os.environ.get("STREAM_EDIT_THROTTLE_SECS", "0.6"))  # edit rate
 
 TELEGRAM_MAX_LEN = 4096  # Telegram hard limit per message
 
+# Persona / instruction suffix
+PERSONA_SUFFIX = (
+    "Questions about Konrad or Konrad Strachan are probably related to the author "
+    "of this bot. Konrad is a software developer. The name of this program or AI bot "
+    "is Anna. Konrad gave Anna her name."
+)
+
 # System prompts / modes
-SYSTEM_PROMPT_BRIEF = "Answer briefly in a couple of sentences."
-SYSTEM_PROMPT_FULL = "Provide a clear, comprehensive, and accurate answer."
+SYSTEM_PROMPT_BRIEF = f"{PERSONA_SUFFIX} Answer briefly in a couple of sentences."
+SYSTEM_PROMPT_FULL = f"{PERSONA_SUFFIX} Provide a clear, comprehensive, and accurate answer."
 CURRENT_MODE = "brief"  # default: brief answers for normal messages
 
 if not TELEGRAM_BOT_TOKEN or not ALLOWED_USER_IDS:
@@ -63,6 +70,24 @@ async def get_ollama_models(session: aiohttp.ClientSession, host: str) -> List[s
         data = await resp.json()
         models = [m.get("name") for m in data.get("models", []) if m.get("name")]
         return sorted(dict.fromkeys(models))
+
+async def select_startup_model(preferred: str, host: str) -> str:
+    """
+    Ensure we start with a model that actually exists in Ollama.
+    Falls back to the first available model if preferred is missing.
+    """
+    async with aiohttp.ClientSession() as session:
+        models = await get_ollama_models(session, host)
+    if not models:
+        raise SystemExit(
+            "No models found in Ollama. Use `ollama pull <model>` to install one."
+        )
+    if preferred in models:
+        print(f"[startup] Using preferred model: {preferred}")
+        return preferred
+    fallback = models[0]
+    print(f"[startup] Preferred model '{preferred}' not found. Using available model: {fallback}")
+    return fallback
 
 def chunk_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
     return [text[i:i+limit] for i in range(0, len(text), limit)]
@@ -393,6 +418,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # Entrypoint
 # -------------------------
 def main() -> None:
+    global OLLAMA_MODEL
+    # Pick a valid Ollama model before starting the bot
+    OLLAMA_MODEL = asyncio.run(select_startup_model(OLLAMA_MODEL, OLLAMA_HOST))
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     app: Application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -405,7 +437,8 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_error_handler(error_handler)
 
-    app.run_polling(close_loop=False)
+    # No close_loop arg; let PTB manage lifecycle
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
