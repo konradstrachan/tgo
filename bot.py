@@ -99,8 +99,31 @@ STATE_SCHEMA_HINT = {
 }
 
 # -------------------------
+# Dirty flags for conditional saves
+# -------------------------
+DIRTY: Dict[str, bool] = {
+    "memory": False,
+    "vector": False,
+    "state": False,
+}
+
+def _mark_dirty(which: str) -> None:
+    if which in DIRTY:
+        DIRTY[which] = True
+
+def _clear_dirty(which: Optional[str] = None) -> None:
+    if which is None:
+        for k in DIRTY:
+            DIRTY[k] = False
+    else:
+        if which in DIRTY:
+            DIRTY[which] = False
+
+def _anything_dirty() -> bool:
+    return any(DIRTY.values())
+
+# -------------------------
 # Episodic/Semantic vector memory for RAG (per user)
-# Each item: {"id": str, "ts": float, "role": "user"/"assistant"/"result", "text": str, "meta": dict, "vec": List[float]|None}
 # -------------------------
 class VectorStore:
     def __init__(self) -> None:
@@ -124,6 +147,7 @@ class VectorStore:
         self.store[user_id].append(item)
         if len(self.store[user_id]) > 1000:
             self.store[user_id] = self.store[user_id][-1000:]
+        _mark_dirty("vector")
 
     async def search(self, session: aiohttp.ClientSession, user_id: int, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         items = self.store.get(user_id, [])
@@ -155,6 +179,7 @@ class VectorStore:
 
     def wipe(self, user_id: int) -> None:
         self.store[user_id] = []
+        _mark_dirty("vector")
 
 VECTOR_STORE = VectorStore()
 
@@ -239,7 +264,7 @@ async def select_startup_model(preferred: str, host: str) -> str:
     return fallback
 
 # -------------------------
-# Rolling state distillation
+# Rolling state distillation (only mark dirty if actual change)
 # -------------------------
 async def update_rolling_state(session: aiohttp.ClientSession, user_id: int) -> None:
     prev = ROLLING_STATE.get(user_id) or {"facts": [], "goals": [], "assumptions": [], "todos": [], "updated": utc_now_iso()}
@@ -282,17 +307,20 @@ async def update_rolling_state(session: aiohttp.ClientSession, user_id: int) -> 
             if start != -1 and end != -1 and end > start:
                 blob = content[start:end + 1]
                 new_state = json.loads(blob)
+                # normalize
                 for k in ("facts", "goals", "assumptions", "todos"):
                     if k not in new_state or not isinstance(new_state[k], list):
                         new_state[k] = prev.get(k, [])
                 if "updated" not in new_state:
                     new_state["updated"] = utc_now_iso()
-                ROLLING_STATE[user_id] = new_state
+
+                if json.dumps(new_state, sort_keys=True) != json.dumps(prev, sort_keys=True):
+                    ROLLING_STATE[user_id] = new_state
+                    _mark_dirty("state")
                 return
     except Exception:
         pass
-    prev["updated"] = utc_now_iso()
-    ROLLING_STATE[user_id] = prev
+    # If model call fails, don't touch the state to avoid pointless saves.
 
 # -------------------------
 # Build layered context (state + RAG + small recency window + self-check)
@@ -536,16 +564,22 @@ def _memory_prune(user_id: int) -> None:
     if not dq:
         return
     now = time.time()
+    changed = False
     while dq and (now - dq[0][0] > MEMORY_TTL_SECS):
         dq.popleft()
+        changed = True
     while len(dq) > MEMORY_MAX_PER_USER:
         dq.popleft()
+        changed = True
+    if changed:
+        _mark_dirty("memory")
 
 def memory_add(user_id: int, role: str, text: str) -> None:
     if user_id not in USER_MEMORY:
         USER_MEMORY[user_id] = deque()
     dq = USER_MEMORY[user_id]
     dq.append((time.time(), role, text))
+    _mark_dirty("memory")
     _memory_prune(user_id)
 
 def memory_get_entries(user_id: int) -> List[Tuple[float, str, str]]:
@@ -600,7 +634,7 @@ def _log_query(user_id: int, prompt: str) -> None:
     print(f"{user_id} : {prompt}")
 
 # -------------------------
-# Persistence: save/load periodic + on shutdown
+# Persistence: save/load only when changed
 # -------------------------
 SAVE_TASK: Optional[asyncio.Task] = None
 
@@ -632,6 +666,7 @@ def _deserialize_user_memory(d: Dict[str, Any]) -> None:
                 continue
         USER_MEMORY[uid] = dq
         _memory_prune(uid)
+    _clear_dirty("memory")  # loaded baseline, not dirty
 
 def _serialize_vector_store() -> Dict[str, List[Dict[str, Any]]]:
     out: Dict[str, List[Dict[str, Any]]] = {}
@@ -660,6 +695,7 @@ def _deserialize_vector_store(d: Dict[str, Any]) -> None:
             except Exception:
                 continue
         VECTOR_STORE.store[uid] = safe_items
+    _clear_dirty("vector")
 
 def _serialize_state() -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
@@ -676,7 +712,6 @@ def _deserialize_state(d: Dict[str, Any]) -> None:
             continue
         if not isinstance(state, dict):
             continue
-        # minimal validation
         s = {
             "facts": list(state.get("facts", [])),
             "goals": list(state.get("goals", [])),
@@ -685,24 +720,22 @@ def _deserialize_state(d: Dict[str, Any]) -> None:
             "updated": str(state.get("updated", utc_now_iso())),
         }
         ROLLING_STATE[uid] = s
+    _clear_dirty("state")
 
 def load_all() -> None:
     _ensure_data_dir()
-    # Memory
     try:
         if os.path.exists(MEMORY_FILE):
             with open(MEMORY_FILE, "r", encoding="utf-8") as f:
                 _deserialize_user_memory(json.load(f))
     except Exception as e:
         print(f"[startup] Failed to load user memory: {e}")
-    # Vector store
     try:
         if os.path.exists(VECTOR_FILE):
             with open(VECTOR_FILE, "r", encoding="utf-8") as f:
                 _deserialize_vector_store(json.load(f))
     except Exception as e:
         print(f"[startup] Failed to load vector store: {e}")
-    # Rolling state
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -710,32 +743,49 @@ def load_all() -> None:
     except Exception as e:
         print(f"[startup] Failed to load rolling state: {e}")
 
-def save_all() -> None:
+def save_all() -> bool:
+    """
+    Save only components that are dirty. Returns True if anything was saved.
+    """
     _ensure_data_dir()
+    saved_any = False
     # Memory
-    try:
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(_serialize_user_memory(), f)
-    except Exception as e:
-        print(f"[save] Failed to save user memory: {e}")
+    if DIRTY.get("memory"):
+        try:
+            with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(_serialize_user_memory(), f)
+            _clear_dirty("memory")
+            saved_any = True
+        except Exception as e:
+            print(f"[save] Failed to save user memory: {e}")
     # Vector store
-    try:
-        with open(VECTOR_FILE, "w", encoding="utf-8") as f:
-            json.dump(_serialize_vector_store(), f)
-    except Exception as e:
-        print(f"[save] Failed to save vector store: {e}")
+    if DIRTY.get("vector"):
+        try:
+            with open(VECTOR_FILE, "w", encoding="utf-8") as f:
+                json.dump(_serialize_vector_store(), f)
+            _clear_dirty("vector")
+            saved_any = True
+        except Exception as e:
+            print(f"[save] Failed to save vector store: {e}")
     # State
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_serialize_state(), f)
-    except Exception as e:
-        print(f"[save] Failed to save rolling state: {e}")
+    if DIRTY.get("state"):
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(_serialize_state(), f)
+            _clear_dirty("state")
+            saved_any = True
+        except Exception as e:
+            print(f"[save] Failed to save rolling state: {e}")
+
+    return saved_any
 
 async def periodic_saver(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         await asyncio.sleep(SAVE_INTERVAL_SECS)
-        save_all()
-        print(f"[autosave] Data saved at {utc_now_iso()}")
+        if _anything_dirty():
+            if save_all():
+                print(f"[autosave] Data saved at {utc_now_iso()}")
+        # else: do nothing (no-op save)
 
 def print_loaded_stats() -> None:
     users_mem = len(USER_MEMORY)
@@ -750,8 +800,12 @@ def print_loaded_stats() -> None:
         f"  - Rolling state:     {users_state} user(s) have state"
     )
 
-# Ensure on normal interpreter exit we write once
-atexit.register(save_all)
+# Ensure on normal interpreter exit we write once (only if dirty)
+def _atexit_save():
+    if _anything_dirty():
+        save_all()
+        print("[shutdown] Final save complete (atexit).")
+atexit.register(_atexit_save)
 
 # -------------------------
 # Handlers
@@ -855,9 +909,17 @@ async def wipememory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     USER_MEMORY[user_id] = deque()
     VECTOR_STORE.wipe(user_id)
+    # Reset rolling state only if it existed or not empty
+    had_state = user_id in ROLLING_STATE
     ROLLING_STATE[user_id] = {"facts": [], "goals": [], "assumptions": [], "todos": [], "updated": utc_now_iso()}
-    save_all()  # persist immediately
-    await update.message.reply_text("🧹 Memory, vector store, and rolling state wiped for your user.")
+    if had_state:
+        _mark_dirty("state")
+    _mark_dirty("memory")
+    # vector already marked dirty inside wipe()
+    if save_all():
+        await update.message.reply_text("🧹 Memory, vector store, and rolling state wiped (saved).")
+    else:
+        await update.message.reply_text("🧹 Memory, vector store, and rolling state wiped.")
 
 async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
@@ -936,12 +998,12 @@ async def get_ollama_models_cmd(update: Update, context: ContextTypes.DEFAULT_TY
             return
     if not models:
         await update.message.reply_text("No models found on Ollama. Try `ollama pull <model>`.")
-        return
-    await update.message.reply_text(
-        text=f"Select a model (current: `{OLLAMA_MODEL}`):",
-        reply_markup=build_models_keyboard(models),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    else:
+        await update.message.reply_text(
+            text=f"Select a model (current: `{OLLAMA_MODEL}`):",
+            reply_markup=build_models_keyboard(models),
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 async def models_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -1050,10 +1112,12 @@ def main() -> None:
     stop_event = asyncio.Event()
 
     def _graceful_save_and_stop(signame: str) -> None:
-        print(f"[signal] Caught {signame}, saving and shutting down…")
-        save_all()
+        print(f"[signal] Caught {signame}, attempting save…")
+        if _anything_dirty():
+            if save_all():
+                print("[signal] Saved pending changes.")
+        # PTB will handle shutdown; we only ensure save attempt here.
 
-    # Register signal handlers (best-effort; some platforms may not support)
     try:
         loop.add_signal_handler(signal.SIGINT, _graceful_save_and_stop, "SIGINT")
         loop.add_signal_handler(signal.SIGTERM, _graceful_save_and_stop, "SIGTERM")
@@ -1081,15 +1145,17 @@ def main() -> None:
     try:
         app.run_polling()
     finally:
-        # Stop periodic saver and persist once more
+        # Stop periodic saver and persist once more if needed
         try:
             stop_event.set()
             if SAVE_TASK:
                 SAVE_TASK.cancel()
         except Exception:
             pass
-        save_all()
-        print("[shutdown] Final save complete.")
+        if _anything_dirty():
+            if save_all():
+                print("[shutdown] Final save complete.")
+        print("[shutdown] Bot stopped.")
 
 if __name__ == "__main__":
     main()
