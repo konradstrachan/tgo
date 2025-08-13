@@ -30,22 +30,35 @@ ALLOWED_USER_IDS = [
     int(uid.strip()) for uid in os.environ.get("ALLOWED_USER_IDS", "").split(",") if uid.strip()
 ]
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")  # preferred model name
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")  # preferred model name
 OLLAMA_TIMEOUT_SECS = int(os.environ.get("OLLAMA_TIMEOUT_SECS", "300"))  # per request timeout
 STREAM_EDIT_THROTTLE_SECS = float(os.environ.get("STREAM_EDIT_THROTTLE_SECS", "0.6"))  # edit rate
 
 TELEGRAM_MAX_LEN = 4096  # Telegram hard limit per message
 
-# Persona / instruction suffix
-PERSONA_SUFFIX = (
-    "Questions about Konrad are probably related to the author of this bot. "
-    "Konrad is a software developer. The name of this program or AI bot is Anna. "
-    "Konrad gave Anna her name."
+QUESTION_PLACEHOLDER = "⏳"
+# Thinking placeholder shown during <think>...</think>
+THINKING_PLACEHOLDER = "🧠"
+
+# -------------------------
+# System prompts / modes
+# -------------------------
+# Improve prompt so the bot only mentions Konrad/Anna when relevant.
+BASE_INSTRUCTIONS = (
+    "You will be provided with a message from a user. Your job is to reply to this message"
+    "You are Anna, a helpful AI assistant. "
+    "Answer accurately and directly based on the user's request. "
+    "Do NOT mention Konrad Strachan or your own name unless the user explicitly asks about "
+    "Konrad, the author, the bot's identity, or Anna. "
+    "If the user asks about Konrad: he is a software developer and the author who named you Anna. "
+    "Otherwise, avoid bringing this up. "
 )
 
-# System prompts / modes
-SYSTEM_PROMPT_BRIEF = f"{PERSONA_SUFFIX} Answer briefly in a couple of sentences."
-SYSTEM_PROMPT_FULL = f"{PERSONA_SUFFIX} Provide a clear, comprehensive, and accurate answer."
+BRIEF_STYLE = "Keep the answer brief (1–3 sentences), unless the user asks for more detail."
+FULL_STYLE = "Provide a clear, comprehensive, and accurate answer."
+
+SYSTEM_PROMPT_BRIEF = f"{BASE_INSTRUCTIONS} {BRIEF_STYLE}"
+SYSTEM_PROMPT_FULL = f"{BASE_INSTRUCTIONS} {FULL_STYLE}"
 CURRENT_MODE = "brief"  # default: brief answers for normal messages
 
 # Special markers for thinking control in stream
@@ -106,7 +119,7 @@ async def stream_ollama_chat(
 ) -> AsyncGenerator[str, None]:
     """
     Streams text chunks from Ollama's /api/chat endpoint.
-    Hides content inside <think>...</think>: shows a temporary "Thinking.." placeholder,
+    Hides content inside <think>...</think>: shows a temporary THINKING_PLACEHOLDER,
     then removes it and continues with the real content after </think>.
     Yields only deltas (new text), not the entire accumulated text.
     Special control markers THINK_START/THINK_END are yielded to manage the placeholder.
@@ -197,21 +210,44 @@ async def send_or_edit_streamed(
 ) -> None:
     """
     Sends a placeholder message and live-edits it as chunks arrive.
-    Handles THINK_START/THINK_END to show 'Thinking..' temporarily and replace it afterward.
+    Handles THINK_START/THINK_END to show THINKING_PLACEHOLDER temporarily and replace it afterward.
+    Skips Telegram edits when the content hasn't changed to avoid 'Message is not modified' errors.
     """
     chat_id = update.effective_chat.id
-    sent = await context.bot.send_message(chat_id=chat_id, text="⏳ …")
+    sent = await context.bot.send_message(chat_id=chat_id, text=QUESTION_PLACEHOLDER)
     displayed = ""            # What we currently show in Telegram
     has_thinking = False
     last_edit = 0.0
+    last_rendered: Optional[str] = None  # Track last rendered text to avoid identical edits
 
     def render_text(s: str) -> str:
         # Telegram edit helper: keep within limit; show the last part if too long.
         if len(s) <= TELEGRAM_MAX_LEN:
             return s
-        # If too long, we keep the tail and prepend an ellipsis
         tail = s[-(TELEGRAM_MAX_LEN - 1):]
         return "…" + tail
+
+    async def safe_edit(new_text: str, use_markdown: bool = True) -> None:
+        nonlocal last_rendered, last_edit, sent
+        rendered = render_text(new_text)
+        if rendered == (last_rendered or ""):
+            return  # Skip identical edits to avoid 'Message is not modified'
+        try:
+            if use_markdown:
+                await sent.edit_text(rendered, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+            else:
+                await sent.edit_text(rendered)
+            last_rendered = rendered
+            last_edit = time.time()
+        except Exception:
+            # Retry once without markdown (e.g., bad markdown)
+            try:
+                await sent.edit_text(rendered)
+                last_rendered = rendered
+                last_edit = time.time()
+            except Exception:
+                # Still failing; swallow to keep streaming going
+                pass
 
     try:
         async for piece in text_stream:
@@ -221,62 +257,41 @@ async def send_or_edit_streamed(
                 if not has_thinking:
                     has_thinking = True
                     displayed = displayed.rstrip()
-                    displayed = (displayed + ("\n" if displayed else "") + "⏳ Thinking..").strip()
-                # Throttled edit
+                    displayed = (displayed + ("\n" if displayed else "") + THINKING_PLACEHOLDER).strip()
                 if now - last_edit >= STREAM_EDIT_THROTTLE_SECS:
-                    try:
-                        await sent.edit_text(render_text(displayed))
-                        last_edit = now
-                    except Exception:
-                        pass
+                    await safe_edit(displayed, use_markdown=False)
                 continue
 
             if piece == THINK_END:
                 if has_thinking:
                     has_thinking = False
-                    # Remove trailing 'Thinking..' (possibly preceded by newline)
-                    if displayed.endswith("⏳ Thinking.."):
-                        displayed = displayed[:-len("⏳ Thinking..")].rstrip()
-                    elif displayed.endswith("\n⏳ Thinking.."):
-                        displayed = displayed[: -len("\n⏳ Thinking..")]
-                    # We'll append the next real text on subsequent pieces
-                # Throttled edit after removal
+                    # Remove placeholder (with or without preceding newline)
+                    if displayed.endswith(THINKING_PLACEHOLDER):
+                        displayed = displayed[:-len(THINKING_PLACEHOLDER)].rstrip()
+                    elif displayed.endswith("\n" + THINKING_PLACEHOLDER):
+                        displayed = displayed[: -len("\n" + THINKING_PLACEHOLDER)]
                 if now - last_edit >= STREAM_EDIT_THROTTLE_SECS:
-                    try:
-                        await sent.edit_text(render_text(displayed if displayed else ""))
-                        last_edit = now
-                    except Exception:
-                        pass
+                    await safe_edit(displayed, use_markdown=False)
                 continue
 
             # Normal text delta
             if piece:
-                # If we were thinking, the placeholder was already removed above; just append real text
-                displayed += (("" if not displayed or displayed.endswith("\n") else "") + piece)
-                # Throttled edit
+                displayed += piece
                 if now - last_edit >= STREAM_EDIT_THROTTLE_SECS:
-                    try:
-                        await sent.edit_text(render_text(displayed), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-                        last_edit = now
-                    except Exception:
-                        # Retry without markdown if parse error
-                        try:
-                            await sent.edit_text(render_text(displayed))
-                            last_edit = now
-                        except Exception:
-                            pass
+                    await safe_edit(displayed, use_markdown=True)
 
         # Final flush
         if not displayed.strip():
-            await sent.edit_text("✅ Done (no output).")
+            await safe_edit("✅ Done (no output).", use_markdown=False)
         else:
-            # Make sure final text is set without the placeholder
-            try:
-                await sent.edit_text(render_text(displayed), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-            except Exception:
-                await sent.edit_text(render_text(displayed))
+            await safe_edit(displayed, use_markdown=True)
+
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Error: {e}")
+        # If anything unexpected happens, report once
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Error: {e}")
+        except Exception:
+            pass
 
 def build_models_keyboard(models: List[str], per_row: int = 2) -> InlineKeyboardMarkup:
     buttons: List[List[InlineKeyboardButton]] = []
