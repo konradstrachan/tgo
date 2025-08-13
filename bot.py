@@ -2,7 +2,9 @@ import asyncio
 import json
 import os
 import time
-from typing import AsyncGenerator, Optional, List
+from collections import deque
+from typing import AsyncGenerator, Optional, List, Deque, Dict, Tuple
+from datetime import datetime, timezone
 
 import aiohttp
 from telegram import (
@@ -65,6 +67,77 @@ CURRENT_MODE = "brief"  # default: brief answers for normal messages
 THINK_START = "\x00THINK_START\x00"
 THINK_END = "\x00THINK_END\x00"
 
+# -------------------------
+# Per-user ephemeral memory (24h TTL, max 100 messages)
+# -------------------------
+MEMORY_TTL_SECS = 24 * 60 * 60
+MEMORY_MAX_PER_USER = 100
+# user_id -> deque of (timestamp, text)
+USER_MEMORY: Dict[int, Deque[Tuple[float, str]]] = {}
+
+def _memory_prune(user_id: int) -> None:
+    """Remove messages older than TTL and trim to max per-user."""
+    dq = USER_MEMORY.get(user_id)
+    if not dq:
+        return
+    now = time.time()
+    # Drop by TTL
+    while dq and (now - dq[0][0] > MEMORY_TTL_SECS):
+        dq.popleft()
+    # Enforce max size
+    while len(dq) > MEMORY_MAX_PER_USER:
+        dq.popleft()
+
+def memory_add(user_id: int, text: str) -> None:
+    """Append a user message with timestamp, enforcing TTL and limit."""
+    if user_id not in USER_MEMORY:
+        USER_MEMORY[user_id] = deque()
+    dq = USER_MEMORY[user_id]
+    dq.append((time.time(), text))
+    _memory_prune(user_id)
+
+def memory_get_user_texts(user_id: int) -> List[str]:
+    """Return list of prior user messages (within TTL, max capped)."""
+    _memory_prune(user_id)
+    dq = USER_MEMORY.get(user_id, deque())
+    return [text for (_ts, text) in dq]
+
+def memory_get_entries(user_id: int) -> List[Tuple[float, str]]:
+    """Return full entries (timestamp, text) after pruning."""
+    _memory_prune(user_id)
+    dq = USER_MEMORY.get(user_id, deque())
+    return list(dq)
+
+def format_memory_entries(entries: List[Tuple[float, str]]) -> List[str]:
+    """
+    Convert entries to a list of message-sized strings, each within TELEGRAM_MAX_LEN.
+    Lines look like:  "12. 2025-08-13 10:15:00Z — Hello world"
+    """
+    if not entries:
+        return ["(no recent messages in the last 24h)"]
+
+    lines = []
+    for idx, (ts, text) in enumerate(entries, start=1):
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+        safe_text = text.replace("\n", " ")  # single line per entry
+        lines.append(f"{idx:02d}. {dt} — {safe_text}")
+
+    chunks: List[str] = []
+    current = ""
+    for line in lines:
+        candidate = (current + "\n" + line) if current else line
+        if len(candidate) <= TELEGRAM_MAX_LEN:
+            current = candidate
+        else:
+            chunks.append(current)
+            current = line
+    if current:
+        chunks.append(current)
+    return chunks
+
+# -------------------------
+# Preconditions
+# -------------------------
 if not TELEGRAM_BOT_TOKEN or not ALLOWED_USER_IDS:
     raise SystemExit(
         "Please set TELEGRAM_BOT_TOKEN and ALLOWED_USER_IDS environment variables."
@@ -116,22 +189,36 @@ async def stream_ollama_chat(
     host: str,
     timeout: int,
     system: Optional[str] = None,
+    history_user_messages: Optional[List[str]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Streams text chunks from Ollama's /api/chat endpoint.
+    Includes recent user-only memory as additional 'user' messages before the current prompt.
     Hides content inside <think>...</think>: shows a temporary THINKING_PLACEHOLDER,
     then removes it and continues with the real content after </think>.
-    Yields only deltas (new text), not the entire accumulated text.
-    Special control markers THINK_START/THINK_END are yielded to manage the placeholder.
+    Yields only deltas (new text).
     """
     url = f"{host.rstrip('/')}/api/chat"
+
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+
+    # Add prior user messages (memory) if any
+    if history_user_messages:
+        for prev in history_user_messages:
+            # Guard against empty strings
+            if prev and prev.strip():
+                messages.append({"role": "user", "content": prev.strip()})
+
+    # Current prompt as the last user message
+    messages.append({"role": "user", "content": prompt})
+
     payload = {
         "model": model,
         "stream": True,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
     }
-    if system:
-        payload["messages"].insert(0, {"role": "system", "content": system})
 
     timeout_obj = aiohttp.ClientTimeout(total=timeout)
     async with session.post(url, json=payload, timeout=timeout_obj) as resp:
@@ -324,7 +411,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /model <name> — set model by name\n"
         "• /whoami — returns your Telegram user ID\n"
         "• /ask <prompt> — brief answer (couple of sentences)\n"
-        "• /full [prompt] — detailed answer; with no prompt switches default mode to full",
+        "• /full [prompt] — detailed answer; with no prompt switches default mode to full\n"
+        "• /memory — show your recent message history (last 24h, max 100)",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -335,6 +423,18 @@ async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"Your Telegram user ID is: {user.id}")
     else:
         await update.message.reply_text("Could not determine your Telegram user ID.")
+
+async def memory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the caller's recent message history (pruned to 24h and capped to 100)."""
+    if not is_authorized(update):
+        return
+    user = update.effective_user
+    entries = memory_get_entries(user.id)
+    chunks = format_memory_entries(entries)
+    # Send in multiple messages if needed
+    for i, chunk in enumerate(chunks, start=1):
+        header = f"🧾 Your memory ({len(entries)} entries):\n" if i == 1 else ""
+        await update.message.reply_text(header + chunk)
 
 async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Brief one-off query (authorized users only)
@@ -347,6 +447,10 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     _log_query(user.id, prompt)
+    # Save the user's message to memory
+    memory_add(user.id, prompt)
+    history = memory_get_user_texts(user.id)
+
     async with aiohttp.ClientSession() as session:
         text_stream = stream_ollama_chat(
             session=session,
@@ -355,6 +459,7 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             host=OLLAMA_HOST,
             timeout=OLLAMA_TIMEOUT_SECS,
             system=SYSTEM_PROMPT_BRIEF,
+            history_user_messages=history[:-1],  # exclude current prompt (already included)
         )
         await send_or_edit_streamed(update, context, text_stream)
 
@@ -372,6 +477,9 @@ async def full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     _log_query(user.id, prompt)
+    memory_add(user.id, prompt)
+    history = memory_get_user_texts(user.id)
+
     async with aiohttp.ClientSession() as session:
         text_stream = stream_ollama_chat(
             session=session,
@@ -380,6 +488,7 @@ async def full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             host=OLLAMA_HOST,
             timeout=OLLAMA_TIMEOUT_SECS,
             system=SYSTEM_PROMPT_FULL,
+            history_user_messages=history[:-1],
         )
         await send_or_edit_streamed(update, context, text_stream)
 
@@ -482,6 +591,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     _log_query(user.id, prompt)
+    # Save to memory and build context
+    memory_add(user.id, prompt)
+    history = memory_get_user_texts(user.id)
 
     system_prompt = SYSTEM_PROMPT_BRIEF if CURRENT_MODE == "brief" else SYSTEM_PROMPT_FULL
 
@@ -493,6 +605,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             host=OLLAMA_HOST,
             timeout=OLLAMA_TIMEOUT_SECS,
             system=system_prompt,
+            history_user_messages=history[:-1],
         )
         await send_or_edit_streamed(update, context, text_stream)
 
@@ -524,6 +637,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("whoami", whoami_cmd))      # unauthenticated
+    app.add_handler(CommandHandler("memory", memory_cmd))      # show user's recent message history
     app.add_handler(CommandHandler("ask", ask_cmd))            # brief, one-off
     app.add_handler(CommandHandler("full", full_cmd))          # detailed or toggle default
     app.add_handler(CommandHandler("model", model_cmd))
