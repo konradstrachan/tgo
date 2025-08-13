@@ -38,15 +38,19 @@ TELEGRAM_MAX_LEN = 4096  # Telegram hard limit per message
 
 # Persona / instruction suffix
 PERSONA_SUFFIX = (
-    "Questions about Konrad or Konrad Strachan are probably related to the author "
-    "of this bot. Konrad is a software developer. The name of this program or AI bot "
-    "is Anna. Konrad gave Anna her name."
+    "Questions about Konrad are probably related to the author of this bot. "
+    "Konrad is a software developer. The name of this program or AI bot is Anna. "
+    "Konrad gave Anna her name."
 )
 
 # System prompts / modes
 SYSTEM_PROMPT_BRIEF = f"{PERSONA_SUFFIX} Answer briefly in a couple of sentences."
 SYSTEM_PROMPT_FULL = f"{PERSONA_SUFFIX} Provide a clear, comprehensive, and accurate answer."
 CURRENT_MODE = "brief"  # default: brief answers for normal messages
+
+# Special markers for thinking control in stream
+THINK_START = "\x00THINK_START\x00"
+THINK_END = "\x00THINK_END\x00"
 
 if not TELEGRAM_BOT_TOKEN or not ALLOWED_USER_IDS:
     raise SystemExit(
@@ -102,7 +106,10 @@ async def stream_ollama_chat(
 ) -> AsyncGenerator[str, None]:
     """
     Streams text chunks from Ollama's /api/chat endpoint.
-    Yields incremental text pieces as they arrive.
+    Hides content inside <think>...</think>: shows a temporary "Thinking.." placeholder,
+    then removes it and continues with the real content after </think>.
+    Yields only deltas (new text), not the entire accumulated text.
+    Special control markers THINK_START/THINK_END are yielded to manage the placeholder.
     """
     url = f"{host.rstrip('/')}/api/chat"
     payload = {
@@ -116,6 +123,13 @@ async def stream_ollama_chat(
     timeout_obj = aiohttp.ClientTimeout(total=timeout)
     async with session.post(url, json=payload, timeout=timeout_obj) as resp:
         resp.raise_for_status()
+
+        thinking = False
+        sent_thinking = False
+        visible_text = ""      # What the user should ultimately see
+        last_yield_len = 0     # Index in visible_text we have already yielded
+        buffer = ""            # Raw buffer of the current streamed chunk
+
         async for line in resp.content:
             if not line:
                 continue
@@ -123,11 +137,57 @@ async def stream_ollama_chat(
                 data = json.loads(line.decode("utf-8").strip() or "{}")
             except json.JSONDecodeError:
                 continue
+
             if "message" in data and data["message"] and "content" in data["message"]:
                 chunk = data["message"]["content"]
                 if chunk:
-                    yield chunk
+                    buffer += chunk
+
+                    # Process any think tags in the buffer
+                    while True:
+                        if not thinking and "<think>" in buffer:
+                            # Emit any visible text before entering <think>
+                            before, after = buffer.split("<think>", 1)
+                            if before:
+                                visible_text += before
+                                delta = visible_text[last_yield_len:]
+                                if delta:
+                                    yield delta
+                                    last_yield_len = len(visible_text)
+                            buffer = after
+                            thinking = True
+                            if not sent_thinking:
+                                yield THINK_START
+                                sent_thinking = True
+                            continue
+
+                        if thinking and "</think>" in buffer:
+                            # Consume everything up to and including </think>, produce no visible text
+                            after = buffer.split("</think>", 1)[1]
+                            buffer = after
+                            thinking = False
+                            yield THINK_END
+                            continue
+
+                        break  # No more tags to process right now
+
+                    # If not in thinking mode, whatever remains in buffer is user-visible
+                    if not thinking and buffer:
+                        visible_text += buffer
+                        delta = visible_text[last_yield_len:]
+                        if delta:
+                            yield delta
+                            last_yield_len = len(visible_text)
+                        buffer = ""
+
             if data.get("done"):
+                # Flush any remaining visible text (should already be handled)
+                if not thinking and buffer:
+                    visible_text += buffer
+                    delta = visible_text[last_yield_len:]
+                    if delta:
+                        yield delta
+                        last_yield_len = len(visible_text)
                 break
 
 async def send_or_edit_streamed(
@@ -137,65 +197,84 @@ async def send_or_edit_streamed(
 ) -> None:
     """
     Sends a placeholder message and live-edits it as chunks arrive.
-    If output grows beyond Telegram limit, sends additional messages in sequence.
+    Handles THINK_START/THINK_END to show 'Thinking..' temporarily and replace it afterward.
     """
     chat_id = update.effective_chat.id
-    sent = await context.bot.send_message(chat_id=chat_id, text="⏳ Running via Ollama…")
-    accumulated = ""
+    sent = await context.bot.send_message(chat_id=chat_id, text="⏳ …")
+    displayed = ""            # What we currently show in Telegram
+    has_thinking = False
     last_edit = 0.0
+
+    def render_text(s: str) -> str:
+        # Telegram edit helper: keep within limit; show the last part if too long.
+        if len(s) <= TELEGRAM_MAX_LEN:
+            return s
+        # If too long, we keep the tail and prepend an ellipsis
+        tail = s[-(TELEGRAM_MAX_LEN - 1):]
+        return "…" + tail
 
     try:
         async for piece in text_stream:
-            accumulated += piece
             now = time.time()
 
-            if len(accumulated) > TELEGRAM_MAX_LEN:
-                chunks = chunk_text(accumulated, TELEGRAM_MAX_LEN)
-                for c in chunks[:-1]:
+            if piece == THINK_START:
+                if not has_thinking:
+                    has_thinking = True
+                    displayed = displayed.rstrip()
+                    displayed = (displayed + ("\n" if displayed else "") + "⏳ Thinking..").strip()
+                # Throttled edit
+                if now - last_edit >= STREAM_EDIT_THROTTLE_SECS:
                     try:
-                        await sent.edit_text(
-                            c[:TELEGRAM_MAX_LEN],
-                            parse_mode=ParseMode.MARKDOWN,
-                            disable_web_page_preview=True,
-                        )
+                        await sent.edit_text(render_text(displayed))
+                        last_edit = now
                     except Exception:
                         pass
-                    sent = await context.bot.send_message(
-                        chat_id=chat_id, text="…", disable_web_page_preview=True
-                    )
-                accumulated = chunks[-1]
+                continue
 
-            if now - last_edit >= STREAM_EDIT_THROTTLE_SECS:
-                try:
-                    await sent.edit_text(
-                        accumulated if accumulated.strip() else "…",
-                        parse_mode=ParseMode.MARKDOWN,
-                        disable_web_page_preview=True,
-                    )
-                    last_edit = now
-                except Exception:
-                    pass
+            if piece == THINK_END:
+                if has_thinking:
+                    has_thinking = False
+                    # Remove trailing 'Thinking..' (possibly preceded by newline)
+                    if displayed.endswith("⏳ Thinking.."):
+                        displayed = displayed[:-len("⏳ Thinking..")].rstrip()
+                    elif displayed.endswith("\n⏳ Thinking.."):
+                        displayed = displayed[: -len("\n⏳ Thinking..")]
+                    # We'll append the next real text on subsequent pieces
+                # Throttled edit after removal
+                if now - last_edit >= STREAM_EDIT_THROTTLE_SECS:
+                    try:
+                        await sent.edit_text(render_text(displayed if displayed else ""))
+                        last_edit = now
+                    except Exception:
+                        pass
+                continue
 
-        if not accumulated.strip():
+            # Normal text delta
+            if piece:
+                # If we were thinking, the placeholder was already removed above; just append real text
+                displayed += (("" if not displayed or displayed.endswith("\n") else "") + piece)
+                # Throttled edit
+                if now - last_edit >= STREAM_EDIT_THROTTLE_SECS:
+                    try:
+                        await sent.edit_text(render_text(displayed), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+                        last_edit = now
+                    except Exception:
+                        # Retry without markdown if parse error
+                        try:
+                            await sent.edit_text(render_text(displayed))
+                            last_edit = now
+                        except Exception:
+                            pass
+
+        # Final flush
+        if not displayed.strip():
             await sent.edit_text("✅ Done (no output).")
-            return
-
-        chunks = chunk_text(accumulated, TELEGRAM_MAX_LEN)
-        try:
-            await sent.edit_text(
-                chunks[0],
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            await sent.edit_text(chunks[0])
-        for c in chunks[1:]:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=c,
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True,
-            )
+        else:
+            # Make sure final text is set without the placeholder
+            try:
+                await sent.edit_text(render_text(displayed), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+            except Exception:
+                await sent.edit_text(render_text(displayed))
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ Error: {e}")
 
@@ -422,6 +501,7 @@ def main() -> None:
     # Pick a valid Ollama model before starting the bot
     OLLAMA_MODEL = asyncio.run(select_startup_model(OLLAMA_MODEL, OLLAMA_HOST))
 
+    # Ensure there's an active event loop for PTB (Python 3.13 compatibility)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -437,7 +517,6 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_error_handler(error_handler)
 
-    # No close_loop arg; let PTB manage lifecycle
     app.run_polling()
 
 if __name__ == "__main__":
