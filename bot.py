@@ -25,7 +25,10 @@ from telegram.ext import (
 # Configuration (env-based)
 # -------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))  # your numeric Telegram user ID
+# Comma-separated list of allowed user IDs
+ALLOWED_USER_IDS = [
+    int(uid.strip()) for uid in os.environ.get("ALLOWED_USER_IDS", "").split(",") if uid.strip()
+]
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")  # default model name
 OLLAMA_TIMEOUT_SECS = int(os.environ.get("OLLAMA_TIMEOUT_SECS", "300"))  # per request timeout
@@ -33,9 +36,14 @@ STREAM_EDIT_THROTTLE_SECS = float(os.environ.get("STREAM_EDIT_THROTTLE_SECS", "0
 
 TELEGRAM_MAX_LEN = 4096  # Telegram hard limit per message
 
-if not TELEGRAM_BOT_TOKEN or not ALLOWED_USER_ID:
+# System prompts / modes
+SYSTEM_PROMPT_BRIEF = "Answer briefly in a couple of sentences."
+SYSTEM_PROMPT_FULL = "Provide a clear, comprehensive, and accurate answer."
+CURRENT_MODE = "brief"  # default: brief answers for normal messages
+
+if not TELEGRAM_BOT_TOKEN or not ALLOWED_USER_IDS:
     raise SystemExit(
-        "Please set TELEGRAM_BOT_TOKEN and ALLOWED_USER_ID environment variables."
+        "Please set TELEGRAM_BOT_TOKEN and ALLOWED_USER_IDS environment variables."
     )
 
 # -------------------------
@@ -43,7 +51,7 @@ if not TELEGRAM_BOT_TOKEN or not ALLOWED_USER_ID:
 # -------------------------
 def is_authorized(update: Update) -> bool:
     user = update.effective_user
-    return bool(user and user.id == ALLOWED_USER_ID)
+    return bool(user and user.id in ALLOWED_USER_IDS)
 
 async def get_ollama_models(session: aiohttp.ClientSession, host: str) -> List[str]:
     """
@@ -53,19 +61,11 @@ async def get_ollama_models(session: aiohttp.ClientSession, host: str) -> List[s
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
         resp.raise_for_status()
         data = await resp.json()
-        # Response shape: { "models": [ { "name": "llama3:8b", ... }, ... ] }
         models = [m.get("name") for m in data.get("models", []) if m.get("name")]
-        # Deduplicate & stable sort (alpha)
         return sorted(dict.fromkeys(models))
 
 def chunk_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + limit, len(text))
-        chunks.append(text[start:end])
-        start = end
-    return chunks
+    return [text[i:i+limit] for i in range(0, len(text), limit)]
 
 async def stream_ollama_chat(
     session: aiohttp.ClientSession,
@@ -124,7 +124,6 @@ async def send_or_edit_streamed(
             accumulated += piece
             now = time.time()
 
-            # When the accumulated text exceeds 4096, send fixed chunks and keep the tail editable.
             if len(accumulated) > TELEGRAM_MAX_LEN:
                 chunks = chunk_text(accumulated, TELEGRAM_MAX_LEN)
                 for c in chunks[:-1]:
@@ -141,7 +140,6 @@ async def send_or_edit_streamed(
                     )
                 accumulated = chunks[-1]
 
-            # Throttle edits to avoid hitting rate limits
             if now - last_edit >= STREAM_EDIT_THROTTLE_SECS:
                 try:
                     await sent.edit_text(
@@ -153,7 +151,6 @@ async def send_or_edit_streamed(
                 except Exception:
                     pass
 
-        # Final flush: send any remaining text cleanly in chunks
         if not accumulated.strip():
             await sent.edit_text("✅ Done (no output).")
             return
@@ -187,9 +184,12 @@ def build_models_keyboard(models: List[str], per_row: int = 2) -> InlineKeyboard
             row = []
     if row:
         buttons.append(row)
-    # Add refresh button
     buttons.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="models:refresh")])
     return InlineKeyboardMarkup(buttons)
+
+def _log_query(user_id: int, prompt: str) -> None:
+    # Log to console whenever someone queries something
+    print(f"{user_id} : {prompt}")
 
 # -------------------------
 # Handlers
@@ -202,9 +202,67 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Current model: `{OLLAMA_MODEL}`\n"
         "Commands:\n"
         "• /models — list models and pick one\n"
-        "• /model <name> — set model by name",
+        "• /model <name> — set model by name\n"
+        "• /whoami — returns your Telegram user ID\n"
+        "• /ask <prompt> — brief answer (couple of sentences)\n"
+        "• /full [prompt] — detailed answer; with no prompt switches default mode to full",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Unauthenticated: respond with the ID of the calling user
+    user = update.effective_user
+    if user:
+        await update.message.reply_text(f"Your Telegram user ID is: {user.id}")
+    else:
+        await update.message.reply_text("Could not determine your Telegram user ID.")
+
+async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Brief one-off query (authorized users only)
+    if not is_authorized(update):
+        return
+    user = update.effective_user
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.message.reply_text("Usage: /ask <your question>")
+        return
+
+    _log_query(user.id, prompt)
+    async with aiohttp.ClientSession() as session:
+        text_stream = stream_ollama_chat(
+            session=session,
+            prompt=prompt,
+            model=OLLAMA_MODEL,
+            host=OLLAMA_HOST,
+            timeout=OLLAMA_TIMEOUT_SECS,
+            system=SYSTEM_PROMPT_BRIEF,
+        )
+        await send_or_edit_streamed(update, context, text_stream)
+
+async def full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Detailed query or toggle default mode to full
+    if not is_authorized(update):
+        return
+    global CURRENT_MODE
+    user = update.effective_user
+    prompt = " ".join(context.args).strip()
+
+    if not prompt:
+        CURRENT_MODE = "full"
+        await update.message.reply_text("✅ Default mode set to: full (normal messages will be detailed).")
+        return
+
+    _log_query(user.id, prompt)
+    async with aiohttp.ClientSession() as session:
+        text_stream = stream_ollama_chat(
+            session=session,
+            prompt=prompt,
+            model=OLLAMA_MODEL,
+            host=OLLAMA_HOST,
+            timeout=OLLAMA_TIMEOUT_SECS,
+            system=SYSTEM_PROMPT_FULL,
+        )
+        await send_or_edit_streamed(update, context, text_stream)
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
@@ -295,12 +353,18 @@ async def models_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Normal text message: obey CURRENT_MODE
     if not is_authorized(update):
         return
+    user = update.effective_user
     prompt = (update.message.text or "").strip()
     if not prompt:
         await update.message.reply_text("Send text only.")
         return
+
+    _log_query(user.id, prompt)
+
+    system_prompt = SYSTEM_PROMPT_BRIEF if CURRENT_MODE == "brief" else SYSTEM_PROMPT_FULL
 
     async with aiohttp.ClientSession() as session:
         text_stream = stream_ollama_chat(
@@ -309,12 +373,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             model=OLLAMA_MODEL,
             host=OLLAMA_HOST,
             timeout=OLLAMA_TIMEOUT_SECS,
+            system=system_prompt,
         )
         await send_or_edit_streamed(update, context, text_stream)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        if isinstance(update, Update) and is_authorized(update) and update.effective_chat:
+        if isinstance(update, Update) and update and update.effective_chat and (
+            isinstance(update, Update) and (update.effective_user and update.effective_user.id in ALLOWED_USER_IDS)
+        ):
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"❌ Internal error: {context.error}",
@@ -329,6 +396,9 @@ def main() -> None:
     app: Application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("whoami", whoami_cmd))      # unauthenticated
+    app.add_handler(CommandHandler("ask", ask_cmd))            # brief, one-off
+    app.add_handler(CommandHandler("full", full_cmd))          # detailed or toggle default
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("models", models_cmd))
     app.add_handler(CallbackQueryHandler(models_callback, pattern="^(setmodel:|models:refresh)"))
