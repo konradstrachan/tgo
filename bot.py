@@ -1105,8 +1105,23 @@ def _deserialize_entities(d: Dict[str, Any]) -> None:
             uid = int(uid_str)
         except Exception:
             continue
+        user_map: Dict[str, Dict[str, Any]] = {}
         if isinstance(obj, dict):
-            ENTITIES[uid] = obj
+            for name, card in obj.items():
+                # Only keep well-formed dict cards
+                if not isinstance(card, dict):
+                    continue
+                safe_card = {
+                    "aliases": list(card.get("aliases", [])) if isinstance(card.get("aliases"), list) else [],
+                    "attrs": dict(card.get("attrs", {})) if isinstance(card.get("attrs"), dict) else {},
+                    "last_seen": str(card.get("last_seen", utc_now_iso())),
+                }
+                # Optional: keep any extra simple fields to avoid data loss
+                for k, v in card.items():
+                    if k not in safe_card and isinstance(k, str) and isinstance(v, (str, int, float, bool, list, dict)):
+                        safe_card[k] = v
+                user_map[str(name)] = safe_card
+        ENTITIES[uid] = user_map
     _clear_dirty("entities")
 
 def _serialize_threads() -> Dict[str, Dict[str, Any]]:
