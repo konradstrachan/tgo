@@ -2,10 +2,9 @@
 
 # About
 
-TgO (Telegram Ollama) is a private, locally hosted Telegram AI assistant that connects to your own Ollama instance.  
-It only responds to queries from pre-approved Telegram users, and can answer in brief or detailed modes.  
-It maintains per-user conversation memory, including rolling state summaries and a semantic vector store for relevant fact retrieval, enabling more context-aware responses.  
-The bot supports model selection from your Ollama models, keeps all processing local for privacy, and never sends your queries to external services.
+TgO (Telegram Ollama) is a private, locally hosted Telegram AI assistant that connects to your own Ollama instance.  It only responds to queries from pre-approved Telegram users, and can answer in brief or detailed modes. 
+
+TgO maintains per-user conversation memory, including rolling state summaries and a semantic vector store for relevant fact retrieval, enabling more context-aware responses. The bot supports model selection from your Ollama models, keeps all processing local for privacy, and never sends your queries to external services.
 
 # Set up instructions
 
