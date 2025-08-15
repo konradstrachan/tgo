@@ -55,8 +55,8 @@ RERANK_TOPN = int(os.environ.get("RERANK_TOPN", "12"))
 
 TELEGRAM_MAX_LEN = 4096
 
-QUESTION_PLACEHOLDER = "🧑‍💻"
-THINKING_PLACEHOLDER = "🤔"
+QUESTION_PLACEHOLDER = "🪩" #✉️
+THINKING_PLACEHOLDER = "🧑‍💻"
 
 # Persistence settings
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
@@ -842,9 +842,18 @@ async def send_or_edit_streamed(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     text_stream: AsyncGenerator[str, None],
+    reply_to_message_id: Optional[int] = None,
 ) -> str:
     chat_id = update.effective_chat.id
-    sent = await context.bot.send_message(chat_id=chat_id, text=QUESTION_PLACEHOLDER)
+    if reply_to_message_id is None and update.effective_message:
+        reply_to_message_id = update.effective_message.message_id
+
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=QUESTION_PLACEHOLDER,
+        reply_to_message_id=reply_to_message_id,
+        allow_sending_without_reply=True,
+    )
     displayed = ""
     has_thinking = False
     last_edit = 0.0
@@ -914,7 +923,12 @@ async def send_or_edit_streamed(
 
     except Exception as e:
         try:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Error: {e}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Error: {e}",
+                reply_to_message_id=reply_to_message_id,
+                allow_sending_without_reply=True,
+            )
         except Exception:
             pass
         return f"❌ Error: {e}"
@@ -1407,7 +1421,12 @@ async def nc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             session=session, prompt=prompt, model=OLLAMA_MODEL, host=OLLAMA_HOST,
             timeout=OLLAMA_TIMEOUT_SECS, system=SYSTEM_PROMPT, history_messages=[]
         )
-        await send_or_edit_streamed(update, context, text_stream)
+        await send_or_edit_streamed(
+            update,
+            context,
+            text_stream,
+            reply_to_message_id=update.effective_message.message_id if update.effective_message else None,
+        )
     # Do NOT store anything for /nc
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1516,7 +1535,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             session=session, prompt=prompt, model=OLLAMA_MODEL, host=OLLAMA_HOST,
             timeout=OLLAMA_TIMEOUT_SECS, system=SYSTEM_PROMPT, history_messages=layered
         )
-        final_text = await send_or_edit_streamed(update, context, text_stream)
+        final_text = await send_or_edit_streamed(
+            update,
+            context,
+            text_stream,
+            reply_to_message_id=update.effective_message.message_id if update.effective_message else None,
+        )
 
         # Persist results
         await VECTOR_STORE.add(session, user.id, "user", prompt, meta={"cmd": "message"})
@@ -1530,7 +1554,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         if isinstance(update, Update) and update and update.effective_chat and (
             isinstance(update, Update) and (update.effective_user and update.effective_user.id in ALLOWED_USER_IDS)
         ):
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Internal error: {context.error}")
+            reply_id = update.effective_message.message_id if getattr(update, "effective_message", None) else None
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"❌ Internal error: {context.error}",
+                reply_to_message_id=reply_id,
+                allow_sending_without_reply=True,
+            )
     except Exception:
         pass
 
