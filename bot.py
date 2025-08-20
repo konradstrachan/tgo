@@ -788,6 +788,10 @@ async def stream_ollama_chat(
             except json.JSONDecodeError:
                 continue
 
+            # Defensive check: skip non-dict payloads
+            if not isinstance(data, dict):
+                continue
+
             if "message" in data and data["message"] and "content" in data["message"]:
                 chunk = data["message"]["content"]
                 if chunk:
@@ -1460,6 +1464,29 @@ async def get_ollama_models_cmd(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.MARKDOWN,
         )
 
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return
+    query = " ".join(context.args).strip()
+    if not query:
+        await update.message.reply_text("Usage: /search <term>")
+        return
+    user_id = update.effective_user.id
+    async with aiohttp.ClientSession() as session:
+        results = await VECTOR_STORE.search(session, user_id, query, top_k=5)
+    if not results:
+        await update.message.reply_text("No relevant memories found.")
+        return
+    lines = []
+    for it in results:
+        ts = datetime.fromtimestamp(it["ts"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+        role = it.get("role", "data")
+        txt = it.get("text", "").replace("\n", " ")
+        if len(txt) > 240:
+            txt = txt[:240] + "…"
+        lines.append(f"- {ts} [{role}] {txt}")
+    await update.message.reply_text("🔍 Search results:\n" + "\n".join(lines))
+
 async def models_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query:
@@ -1610,6 +1637,7 @@ def main() -> None:
     app.add_handler(CommandHandler("nc", nc_cmd))
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("models", get_ollama_models_cmd))
+    app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CallbackQueryHandler(models_callback, pattern="^(setmodel:|models:refresh)"))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_error_handler(error_handler)
