@@ -34,13 +34,20 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USER_IDS = [
     int(uid.strip()) for uid in os.environ.get("ALLOWED_USER_IDS", "").split(",") if uid.strip()
 ]
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
+
+# Llamaswap / OpenAI-compatible backend
+OPENAI_API_KEY = os.environ.get("LLAMASWAP_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+
+# Base URL of llamaswap, e.g. "http://127.0.0.1:4000"
+# We append /v1/... in individual calls.
+OLLAMA_HOST = os.environ.get("LLAMASWAP_BASE", os.environ.get("OPENAI_API_BASE", "http://127.0.0.1:4000"))
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gpt-4o-mini")
 OLLAMA_TIMEOUT_SECS = int(os.environ.get("OLLAMA_TIMEOUT_SECS", "300"))
 STREAM_EDIT_THROTTLE_SECS = float(os.environ.get("STREAM_EDIT_THROTTLE_SECS", "0.6"))
 
 # Embeddings (for RAG)
-OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+# Default to an OpenAI-style embedding model name, but override via env as needed.
+OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "text-embedding-3-large")
 EMBED_TIMEOUT_SECS = int(os.environ.get("EMBED_TIMEOUT_SECS", "30"))
 
 # Hybrid retrieval weights
@@ -55,7 +62,7 @@ RERANK_TOPN = int(os.environ.get("RERANK_TOPN", "12"))
 
 TELEGRAM_MAX_LEN = 4096
 
-QUESTION_PLACEHOLDER = "🪩" #✉️
+QUESTION_PLACEHOLDER = "🪩"  # ✉️
 THINKING_PLACEHOLDER = "🧑‍💻"
 
 # Persistence settings
@@ -154,6 +161,15 @@ def _clear_dirty(which: Optional[str] = None) -> None:
 
 def _anything_dirty() -> bool:
     return any(DIRTY.values())
+
+# -------------------------
+# OpenAI-style headers
+# -------------------------
+def _openai_headers() -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if OPENAI_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+    return headers
 
 # -------------------------
 # Episodic/Semantic vector memory for RAG (per user) + topics
@@ -338,18 +354,21 @@ def _log_query(user_id: int, prompt: str) -> None:
     print(f"{user_id} : {prompt}")
 
 # -------------------------
-# Embeddings via Ollama
+# Embeddings via Llamaswap/OpenAI
 # -------------------------
 async def embed_text(session: aiohttp.ClientSession, text: str) -> Optional[List[float]]:
     try:
-        url = f"{OLLAMA_HOST.rstrip('/')}/api/embeddings"
-        payload = {"model": OLLAMA_EMBED_MODEL, "prompt": text}
+        url = f"{OLLAMA_HOST.rstrip('/')}/v1/embeddings"
+        payload = {"model": OLLAMA_EMBED_MODEL, "input": text}
         timeout_obj = aiohttp.ClientTimeout(total=EMBED_TIMEOUT_SECS)
-        async with session.post(url, json=payload, timeout=timeout_obj) as resp:
+        async with session.post(url, json=payload, headers=_openai_headers(), timeout=timeout_obj) as resp:
             if resp.status != 200:
                 return None
             data = await resp.json()
-            vec = data.get("embedding")
+            items = data.get("data", [])
+            if not items:
+                return None
+            vec = items[0].get("embedding")
             if isinstance(vec, list) and (not vec or isinstance(vec[0], (int, float))):
                 return [float(x) for x in vec]
     except Exception:
@@ -357,12 +376,13 @@ async def embed_text(session: aiohttp.ClientSession, text: str) -> Optional[List
     return None
 
 # -------------------------
-# Topic extraction (lightweight via LLM; fallback heuristics)
+# Topic extraction (via Llamaswap/OpenAI; fallback heuristics)
 # -------------------------
 async def extract_topics(session: aiohttp.ClientSession, text: str) -> List[str]:
     text = text.strip()
     if not text:
         return []
+
     # quick heuristic fallback
     def heur() -> List[str]:
         words = re.findall(r"[A-Za-z]{3,}", text.lower())
@@ -371,80 +391,114 @@ async def extract_topics(session: aiohttp.ClientSession, text: str) -> List[str]
             freq[w] = freq.get(w, 0) + 1
         common = sorted(freq.items(), key=lambda x: x[1], reverse=True)
         return [w for w, _c in common[:3]]
-    # Try LLM JSON tags
+
     try:
-        url = f"{OLLAMA_HOST.rstrip('/')}/api/chat"
+        url = f"{OLLAMA_HOST.rstrip('/')}/v1/chat/completions"
         payload = {
             "model": OLLAMA_MODEL,
             "stream": False,
+            "temperature": 0.0,
             "messages": [
                 {"role": "system", "content": "Return ONLY a JSON array (max 3 short topic tags)."},
-                {"role": "user", "content": f"Text:\n{text}\n\nReturn JSON array of up to 3 short topic tags."},
+                {
+                    "role": "user",
+                    "content": f"Text:\n{text}\n\nReturn JSON array of up to 3 short topic tags.",
+                },
             ],
         }
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+        async with session.post(
+            url,
+            json=payload,
+            headers=_openai_headers(),
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
             resp.raise_for_status()
             data = await resp.json()
-            content = (data.get("message") or {}).get("content", "").strip()
+            content = (
+                (data.get("choices") or [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
             start = content.find("[")
             end = content.rfind("]")
             if start != -1 and end != -1 and end > start:
-                arr = json.loads(content[start:end+1])
+                arr = json.loads(content[start:end + 1])
                 tags = [str(x).strip().lower() for x in arr if isinstance(x, (str, int, float))]
-                # keep short tags
                 tags = [t[:24] for t in tags if t]
                 return tags[:3]
     except Exception:
         pass
+
     return heur()
 
 # -------------------------
-# LLM-based reranker (optional)
+# LLM-based reranker (optional, via Llamaswap/OpenAI)
 # -------------------------
 async def rerank_with_llm(session: aiohttp.ClientSession, query: str, items: List[Dict[str, Any]]) -> List[Tuple[float, Dict[str, Any]]]:
-    # Score each item 0..1 with a compact prompt; fallback equal scores
     out: List[Tuple[float, Dict[str, Any]]] = []
     if not items:
         return out
+
+    url = f"{OLLAMA_HOST.rstrip('/')}/v1/chat/completions"
+
     for it in items:
         try:
             payload = {
                 "model": OLLAMA_MODEL,
                 "stream": False,
+                "temperature": 0.0,
                 "messages": [
                     {"role": "system", "content": "Score relevance 0..1 as a JSON number only."},
-                    {"role": "user", "content": f"Query: {query}\n\nCandidate: {it.get('text','')[:800]}\n\nReturn a number 0..1 only."}
-                ]
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Query: {query}\n\n"
+                            f"Candidate: {it.get('text', '')[:800]}\n\n"
+                            "Return a number 0..1 only."
+                        ),
+                    },
+                ],
             }
-            async with session.post(f"{OLLAMA_HOST.rstrip('/')}/api/chat", json=payload,
-                                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.post(
+                url,
+                json=payload,
+                headers=_openai_headers(),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
-                content = (data.get("message") or {}).get("content", "").strip()
+                content = (
+                    (data.get("choices") or [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+                )
                 m = re.search(r"0?\.\d+|1(?:\.0+)?|0", content)
                 score = float(m.group(0)) if m else 0.5
         except Exception:
             score = 0.5
         out.append((score, it))
+
     out.sort(key=lambda x: x[0], reverse=True)
     return out
 
 # -------------------------
-# Ollama model utils
+# Llamaswap/OpenAI model utils
 # -------------------------
 async def get_ollama_models(session: aiohttp.ClientSession, host: str) -> List[str]:
-    url = f"{host.rstrip('/')}/api/tags"
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+    url = f"{host.rstrip('/')}/v1/models"
+    async with session.get(url, headers=_openai_headers(), timeout=aiohttp.ClientTimeout(total=10)) as resp:
         resp.raise_for_status()
         data = await resp.json()
-        models = [m.get("name") for m in data.get("models", []) if m.get("name")]
+        models = [m.get("id") for m in data.get("data", []) if m.get("id")]
         return sorted(dict.fromkeys(models))
 
 async def select_startup_model(preferred: str, host: str) -> str:
     async with aiohttp.ClientSession() as session:
         models = await get_ollama_models(session, host)
     if not models:
-        raise SystemExit("No models found in Ollama. Use `ollama pull <model>` to install one.")
+        raise SystemExit("No models found on Llamaswap/OpenAI backend.")
     if preferred in models:
         print(f"[startup] Using preferred model: {preferred}")
         return preferred
@@ -525,10 +579,11 @@ async def update_rolling_state(session: aiohttp.ClientSession, user_id: int) -> 
         "Update the state. Only include durable, useful items."
     )
 
-    url = f"{OLLAMA_HOST.rstrip('/')}/api/chat"
+    url = f"{OLLAMA_HOST.rstrip('/')}/v1/chat/completions"
     payload = {
         "model": OLLAMA_MODEL,
         "stream": False,
+        "temperature": 0.0,
         "messages": [
             {"role": "system", "content": system_inst},
             {"role": "user", "content": user_prompt},
@@ -536,10 +591,20 @@ async def update_rolling_state(session: aiohttp.ClientSession, user_id: int) -> 
     }
     new_state = None
     try:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+        async with session.post(
+            url,
+            json=payload,
+            headers=_openai_headers(),
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
             resp.raise_for_status()
             data = await resp.json()
-            content = (data.get("message") or {}).get("content", "").strip()
+            content = (
+                (data.get("choices") or [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
             start = content.find("{")
             end = content.rfind("}")
             if start != -1 and end != -1 and end > start:
@@ -565,35 +630,49 @@ async def update_rolling_state(session: aiohttp.ClientSession, user_id: int) -> 
             _mark_dirty("state")
 
 # -------------------------
-# Entity extraction (very small)
+# Entity extraction (very small) via Llamaswap/OpenAI
 # -------------------------
 async def update_entities(session: aiohttp.ClientSession, user_id: int, text: str) -> None:
     try:
-        url = f"{OLLAMA_HOST.rstrip('/')}/api/chat"
+        url = f"{OLLAMA_HOST.rstrip('/')}/v1/chat/completions"
         payload = {
             "model": OLLAMA_MODEL,
             "stream": False,
+            "temperature": 0.0,
             "messages": [
-                {"role": "system", "content": "Extract up to 3 entities with simple attributes. Return ONLY JSON array of objects {name, attrs}."},
+                {
+                    "role": "system",
+                    "content": "Extract up to 3 entities with simple attributes. Return ONLY JSON array of objects {name, attrs}.",
+                },
                 {"role": "user", "content": f"Text:\n{text}\n\nReturn JSON array."},
             ],
         }
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+        async with session.post(
+            url,
+            json=payload,
+            headers=_openai_headers(),
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
             resp.raise_for_status()
             data = await resp.json()
-            content = (data.get("message") or {}).get("content", "").strip()
+            content = (
+                (data.get("choices") or [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
             start = content.find("[")
             end = content.rfind("]")
             if start == -1 or end == -1 or end <= start:
                 return
-            arr = json.loads(content[start:end+1])
+            arr = json.loads(content[start:end + 1])
             if not isinstance(arr, list):
                 return
             if user_id not in ENTITIES:
                 ENTITIES[user_id] = {}
             changed = False
             for e in arr[:3]:
-                name = str(e.get("name","")).strip()
+                name = str(e.get("name", "")).strip()
                 if not name:
                     continue
                 attrs = e.get("attrs", {})
@@ -617,7 +696,7 @@ async def assign_thread(session: aiohttp.ClientSession, user_id: int, text: str)
 
     # Similarity against current thread seed
     def sim(a: str, b: str) -> float:
-        # simple cosine on embeddings, fallback Jaccard
+        # placeholder – not used, embeddings used instead
         return 0.0
 
     # If no threads yet, create one
@@ -746,7 +825,7 @@ async def build_context_with_budget(session: aiohttp.ClientSession, user_id: int
     return messages
 
 # -------------------------
-# Streaming Chat with <think> filtering
+# Streaming Chat with <think> filtering via Llamaswap/OpenAI
 # -------------------------
 async def stream_ollama_chat(
     session: aiohttp.ClientSession,
@@ -757,21 +836,38 @@ async def stream_ollama_chat(
     system: Optional[str] = None,
     history_messages: Optional[List[Dict[str, str]]] = None,
 ) -> AsyncGenerator[str, None]:
-    url = f"{host.rstrip('/')}/api/chat"
+    url = f"{host.rstrip('/')}/v1/chat/completions"
 
     messages: List[Dict[str, str]] = []
-    if history_messages:
-        for m in history_messages:
-            if m.get("content", "").strip():
-                messages.append({"role": m["role"], "content": m["content"].strip()})
+
+    # System message first
     if system:
         messages.append({"role": "system", "content": system})
+
+    # Add any additional system/data messages and history
+    if history_messages:
+        for m in history_messages:
+            content = (m.get("content") or "").strip()
+            role = m.get("role") or "system"
+            if content:
+                messages.append({"role": role, "content": content})
+
+    # User prompt
     messages.append({"role": "user", "content": prompt})
 
-    payload = {"model": model, "stream": True, "messages": messages}
+    payload = {
+        "model": model,
+        "stream": True,
+        "messages": messages,
+    }
 
     timeout_obj = aiohttp.ClientTimeout(total=timeout)
-    async with session.post(url, json=payload, timeout=timeout_obj) as resp:
+    async with session.post(
+        url,
+        json=payload,
+        headers=_openai_headers(),
+        timeout=timeout_obj,
+    ) as resp:
         resp.raise_for_status()
 
         thinking = False
@@ -780,64 +876,85 @@ async def stream_ollama_chat(
         last_yield_len = 0
         buffer = ""
 
-        async for line in resp.content:
-            if not line:
-                continue
-            try:
-                data = json.loads(line.decode("utf-8").strip() or "{}")
-            except json.JSONDecodeError:
+        async for raw in resp.content:
+            if not raw:
                 continue
 
-            # Defensive check: skip non-dict payloads
-            if not isinstance(data, dict):
-                continue
+            chunk_text = raw.decode("utf-8", errors="ignore")
+            for line in chunk_text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
 
-            if "message" in data and data["message"] and "content" in data["message"]:
-                chunk = data["message"]["content"]
-                if chunk:
-                    buffer += chunk
+                # SSE style: "data: {...}" or "data: [DONE]"
+                if line.startswith("data:"):
+                    line = line[len("data:"):].strip()
 
-                    while True:
-                        if not thinking and "<think>" in buffer:
-                            before, after = buffer.split("<think>", 1)
-                            if before:
-                                visible_text += before
-                                delta = visible_text[last_yield_len:]
-                                if delta:
-                                    yield delta
-                                    last_yield_len = len(visible_text)
-                            buffer = after
-                            thinking = True
-                            if not sent_thinking:
-                                yield THINK_START
-                                sent_thinking = True
-                            continue
-
-                        if thinking and "</think>" in buffer:
-                            after = buffer.split("</think>", 1)[1]
-                            buffer = after
-                            thinking = False
-                            yield THINK_END
-                            continue
-
-                        break
-
+                if line == "[DONE]":
+                    # flush any remaining buffer
                     if not thinking and buffer:
                         visible_text += buffer
-                        delta = visible_text[last_yield_len:]
-                        if delta:
-                            yield delta
+                        delta_out = visible_text[last_yield_len:]
+                        if delta_out:
+                            yield delta_out
                             last_yield_len = len(visible_text)
                         buffer = ""
+                    return
 
-            if data.get("done"):
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if not isinstance(data, dict):
+                    continue
+
+                choices = data.get("choices") or []
+                if not choices:
+                    continue
+
+                choice = choices[0]
+                delta_obj = choice.get("delta") or {}
+                chunk = delta_obj.get("content") or ""
+                if not chunk:
+                    continue
+
+                buffer += chunk
+
+                # Handle <think> markers in the aggregated buffer
+                while True:
+                    if not thinking and "<think>" in buffer:
+                        before, after = buffer.split("<think>", 1)
+                        if before:
+                            visible_text += before
+                            delta_out = visible_text[last_yield_len:]
+                            if delta_out:
+                                yield delta_out
+                                last_yield_len = len(visible_text)
+                        buffer = after
+                        thinking = True
+                        if not sent_thinking:
+                            yield THINK_START
+                            sent_thinking = True
+                        continue
+
+                    if thinking and "</think>" in buffer:
+                        after = buffer.split("</think>", 1)[1]
+                        buffer = after
+                        thinking = False
+                        yield THINK_END
+                        continue
+
+                    break
+
+                # Emit visible text outside of <think> sections
                 if not thinking and buffer:
                     visible_text += buffer
-                    delta = visible_text[last_yield_len:]
-                    if delta:
-                        yield delta
+                    delta_out = visible_text[last_yield_len:]
+                    if delta_out:
+                        yield delta_out
                         last_yield_len = len(visible_text)
-                break
+                    buffer = ""
 
 # -------------------------
 # Telegram streaming edit helper
@@ -1456,7 +1573,7 @@ async def get_ollama_models_cmd(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(f"❌ Could not fetch models: {e}")
             return
     if not models:
-        await update.message.reply_text("No models found on Ollama. Try `ollama pull <model>`.")
+        await update.message.reply_text("No models found on Llamaswap/OpenAI backend.")
     else:
         await update.message.reply_text(
             text=f"Select a model (current: `{OLLAMA_MODEL}`):",
@@ -1521,7 +1638,7 @@ async def models_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
         if not models:
             await query.answer()
-            await query.edit_message_text("No models found on Ollama. Try `ollama pull <model>`.")
+            await query.edit_message_text("No models found on Llamaswap/OpenAI backend.")
             return
         await query.answer("Refreshed")
         try:

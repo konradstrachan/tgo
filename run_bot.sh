@@ -12,10 +12,9 @@ else
     exit 1
 fi
 
-# Activate venv if exists
-if [[ -d ".venv" ]]; then
-    source .venv/bin/activate
-fi
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
 # Run the bot
 exec python3 bot.py
+
