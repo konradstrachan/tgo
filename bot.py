@@ -34,6 +34,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USER_IDS = [
     int(uid.strip()) for uid in os.environ.get("ALLOWED_USER_IDS", "").split(",") if uid.strip()
 ]
+ADMIN_USER_IDS = [
+    int(uid.strip()) for uid in os.environ.get("ADMIN_USER_IDS", "").split(",") if uid.strip()
+]
 
 # Llamaswap / OpenAI-compatible backend
 OPENAI_API_KEY = os.environ.get("LLAMASWAP_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
@@ -315,6 +318,10 @@ def is_authorized(update: Update) -> bool:
     user = update.effective_user
     return bool(user and user.id in ALLOWED_USER_IDS)
 
+def is_admin(update: Update) -> bool:
+    user = update.effective_user
+    return bool(user and user.id in ADMIN_USER_IDS)
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -349,9 +356,6 @@ def short_id(prefix: str = "m") -> str:
 
 def jdump(x: Any) -> str:
     return json.dumps(x, ensure_ascii=False)
-
-def _log_query(user_id: int, prompt: str) -> None:
-    print(f"{user_id} : {prompt}")
 
 # -------------------------
 # Embeddings via Llamaswap/OpenAI
@@ -1457,6 +1461,11 @@ async def forget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def memory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return
+    
+    if not is_admin(update):
+        await update.message.reply_text("Only available to select users")
+        return
+
     user_id = update.effective_user.id
 
     async with aiohttp.ClientSession() as session:
@@ -1520,6 +1529,11 @@ async def memory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def wipememory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return
+    
+    if not is_admin(update):
+        await update.message.reply_text("Only available to select users")
+        return
+
     user_id = update.effective_user.id
     USER_MEMORY[user_id] = deque()
     VECTOR_STORE.wipe(user_id)
@@ -1559,6 +1573,11 @@ async def nc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return
+    
+    if not is_admin(update):
+        await update.message.reply_text("Only available to select users")
+        return
+
     global OLLAMA_MODEL
     if not context.args:
         await update.message.reply_text(
@@ -1572,6 +1591,11 @@ async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def get_ollama_models_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return
+    
+    if not is_admin(update):
+        await update.message.reply_text("Only available to select users")
+        return
+
     async with aiohttp.ClientSession() as session:
         try:
             models = await get_ollama_models(session, OLLAMA_HOST)
@@ -1616,6 +1640,10 @@ async def models_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     if not is_authorized(update):
         await query.answer()
+        return
+    
+    if not is_admin(update):
+        await update.message.reply_text("Only available to select users")
         return
 
     data = query.data or ""
@@ -1665,22 +1693,28 @@ async def models_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # -------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
+        print(f"[IGNORED] {user.id} : {prompt}")
         return
+
     user = update.effective_user
     prompt = (update.message.text or "").strip()
     if not prompt:
         await update.message.reply_text("Send text only.")
         return
 
-    _log_query(user.id, prompt)
+    print(f"[MESSAGE] {user.id} << {prompt}")
+    
     memory_add(user.id, "user", prompt)
 
+    # TODO - if there are multiple messages from the same user, grab them all at once rather than
+    # processing one by one
     async with aiohttp.ClientSession() as session:
         # update entities & threading in the background-ish (await to keep simple)
         await update_entities(session, user.id, prompt)
         await assign_thread(session, user.id, prompt)
 
         layered = await build_context_for_prompt(session, user.id, prompt)
+        print(layered)
         text_stream = stream_ollama_chat(
             session=session, prompt=prompt, model=OLLAMA_MODEL, host=OLLAMA_HOST,
             timeout=OLLAMA_TIMEOUT_SECS, system=SYSTEM_PROMPT, history_messages=layered
@@ -1691,6 +1725,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             text_stream,
             reply_to_message_id=update.effective_message.message_id if update.effective_message else None,
         )
+
+        print(f"[REPLY] {user.id} >> {final_text}")
 
         # Persist results
         await VECTOR_STORE.add(session, user.id, "user", prompt, meta={"cmd": "message"})
