@@ -1717,7 +1717,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         #print(layered)
         text_stream = stream_ollama_chat(
             session=session, prompt=prompt, model=OLLAMA_MODEL, host=OLLAMA_HOST,
-            timeout=OLLAMA_TIMEOUT_SECS, system=SYSTEM_PROMPT, history_messages=layered
+            timeout=OLLAMA_TIMEOUT_SECS, system=SYSTEM_PROMPT#, history_messages=layered
         )
         final_text = await send_or_edit_streamed(
             update,
