@@ -1556,7 +1556,7 @@ async def nc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not prompt:
         await update.message.reply_text("Usage: /nc <your question>")
         return
-    _log_query(user.id, f"(NC) {prompt}")
+    print(user.id, f"(NC) {prompt}")
     async with aiohttp.ClientSession() as session:
         text_stream = stream_ollama_chat(
             session=session, prompt=prompt, model=OLLAMA_MODEL, host=OLLAMA_HOST,
