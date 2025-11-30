@@ -1710,11 +1710,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # processing one by one
     async with aiohttp.ClientSession() as session:
         # update entities & threading in the background-ish (await to keep simple)
-        await update_entities(session, user.id, prompt)
-        await assign_thread(session, user.id, prompt)
+        #await update_entities(session, user.id, prompt)
+        #await assign_thread(session, user.id, prompt)
 
-        layered = await build_context_for_prompt(session, user.id, prompt)
-        print(layered)
+        #layered = await build_context_for_prompt(session, user.id, prompt)
+        #print(layered)
         text_stream = stream_ollama_chat(
             session=session, prompt=prompt, model=OLLAMA_MODEL, host=OLLAMA_HOST,
             timeout=OLLAMA_TIMEOUT_SECS, system=SYSTEM_PROMPT, history_messages=layered
@@ -1729,11 +1729,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         print(f"[REPLY] {user.id} >> {final_text}")
 
         # Persist results
-        await VECTOR_STORE.add(session, user.id, "user", prompt, meta={"cmd": "message"})
-        await VECTOR_STORE.add(session, user.id, "assistant", final_text or "", meta={"cmd": "message"})
-        memory_add(user.id, "assistant", final_text or "")
-        await update_entities(session, user.id, final_text or "")
-        await update_rolling_state(session, user.id)
+        #await VECTOR_STORE.add(session, user.id, "user", prompt, meta={"cmd": "message"})
+        #await VECTOR_STORE.add(session, user.id, "assistant", final_text or "", meta={"cmd": "message"})
+        #memory_add(user.id, "assistant", final_text or "")
+        #await update_entities(session, user.id, final_text or "")
+        #await update_rolling_state(session, user.id)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
