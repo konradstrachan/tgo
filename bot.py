@@ -95,6 +95,9 @@ SYSTEM_PROMPT = f"{BASE_RULES}\n{RESPONSE_STYLE}"
 THINK_START = "\x00THINK_START\x00"
 THINK_END = "\x00THINK_END\x00"
 
+# Marker indicating beginning of final user-visible message
+FINAL_MARKER = "final<|message|>"
+
 # -------------------------
 # Ephemeral transcript memory (24h TTL, max 100 entries)
 # Each entry is (timestamp, role, text)
@@ -826,6 +829,7 @@ async def build_context_with_budget(session: aiohttp.ClientSession, user_id: int
 
 # -------------------------
 # Streaming Chat with <think> filtering via Llamaswap/OpenAI
+# and FINAL_MARKER support
 # -------------------------
 async def stream_ollama_chat(
     session: aiohttp.ClientSession,
@@ -876,6 +880,9 @@ async def stream_ollama_chat(
         last_yield_len = 0
         buffer = ""
 
+        # We ignore all content until FINAL_MARKER is seen.
+        final_mode = False
+
         async for raw in resp.content:
             if not raw:
                 continue
@@ -892,7 +899,7 @@ async def stream_ollama_chat(
 
                 if line == "[DONE]":
                     # flush any remaining buffer
-                    if not thinking and buffer:
+                    if final_mode and not thinking and buffer:
                         visible_text += buffer
                         delta_out = visible_text[last_yield_len:]
                         if delta_out:
@@ -919,6 +926,26 @@ async def stream_ollama_chat(
                 if not chunk:
                     continue
 
+                # Handle FINAL_MARKER: ignore everything before it, and only start
+                # emitting content that appears after the marker.
+                if not final_mode:
+                    idx = chunk.find(FINAL_MARKER)
+                    if idx == -1:
+                        # No marker yet, ignore this chunk entirely (including think content)
+                        continue
+                    # Marker found; switch to final mode and discard everything before it.
+                    final_mode = True
+                    # Reset any previous visible/buffered text so we only show post-marker content.
+                    visible_text = ""
+                    buffer = ""
+                    last_yield_len = 0
+                    # Keep only the substring after the marker.
+                    chunk = chunk[idx + len(FINAL_MARKER):]
+                    if not chunk:
+                        # Nothing after marker in this chunk; wait for next chunks.
+                        continue
+
+                # From here on, final_mode is True; treat content normally with <think> filtering.
                 buffer += chunk
 
                 # Handle <think> markers in the aggregated buffer
@@ -948,7 +975,7 @@ async def stream_ollama_chat(
                     break
 
                 # Emit visible text outside of <think> sections
-                if not thinking and buffer:
+                if final_mode and not thinking and buffer:
                     visible_text += buffer
                     delta_out = visible_text[last_yield_len:]
                     if delta_out:
@@ -1394,6 +1421,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🤖 Ready.\n"
         f"Current model: `{OLLAMA_MODEL}`\n"
         "Commands:\n"
+        "• /ping - check liveness\n"
         "• /models - list models and pick one\n"
         "• /model <name> - set model by name\n"
         "• /whoami - returns your Telegram user ID\n"
@@ -1408,9 +1436,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if user:
+        print(f"[telegram] User {user.id} requested their ID")
         await update.message.reply_text(f"Your Telegram user ID is: {user.id}")
     else:
         await update.message.reply_text("Could not determine your Telegram user ID.")
+
+async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(f"Pong")
 
 async def remember_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
@@ -1747,6 +1779,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("whoami", whoami_cmd))
+    app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("memory", memory_cmd))
     app.add_handler(CommandHandler("wipememory", wipememory_cmd))
     app.add_handler(CommandHandler("remember", remember_cmd))
